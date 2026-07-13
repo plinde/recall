@@ -32,6 +32,10 @@ Enter to jump back in.
 Press `Ctrl+G` to toggle between global and launch-directory (`cwd`) scope. `/` remains a
 compatibility alias for the same toggle.
 
+Press `Ctrl+R` to refresh the index and current results immediately. Recall also refreshes in
+the background every five minutes while the TUI is open; both refresh modes preserve your query,
+scope, and the session you are browsing when it still exists.
+
 To force global scope for one launch, use either:
 ```bash
 recall --global
@@ -46,6 +50,7 @@ recall --global
 | `Enter` | Resume conversation |
 | `Tab` | Copy session ID |
 | `Ctrl+G` | Toggle global/CWD scope (`/` is an alias) |
+| `Ctrl+R` | Refresh indexed results |
 | `Esc` | Quit |
 
 ## Ask it to Search for You

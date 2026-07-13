@@ -512,6 +512,9 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" │ ", dim),
             Span::styled(" ^G ", keycap),
             Span::styled(scope_action, label),
+            Span::styled(" │ ", dim),
+            Span::styled(" ^R ", keycap),
+            Span::styled(" refresh ", label),
         ];
         // Show Enter/Tab only when there's a selection
         if has_selection {

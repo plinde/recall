@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 /// Debounce delay for search (avoid searching on every keystroke during fast typing/paste)
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(50);
+/// Time between completed background refresh passes in the TUI.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Messages from the indexing thread
 pub enum IndexMsg {
@@ -82,7 +84,12 @@ pub struct App {
     /// Total sessions indexed
     pub total_sessions: usize,
     /// Channel to receive indexing updates
-    index_rx: Option<Receiver<IndexMsg>>,
+    index_rx: Receiver<IndexMsg>,
+    /// Channel used to receive updates from refresh workers.
+    index_tx: Sender<IndexMsg>,
+    /// Index and state paths used by each refresh pass.
+    index_path: PathBuf,
+    state_path: PathBuf,
     /// Is indexing in progress
     pub indexing: bool,
     /// Current search scope
@@ -95,6 +102,8 @@ pub struct App {
     last_input: Instant,
     /// Error from indexing thread (shown on exit)
     pub index_error: Option<String>,
+    /// When the next automatic refresh may begin.
+    next_refresh_at: Instant,
 }
 
 impl App {
@@ -128,12 +137,9 @@ impl App {
                 .unwrap_or_default()
         });
 
-        // Start background indexing
+        // Keep the channel alive for the lifetime of the TUI so later refresh
+        // workers can report through the same event-loop path.
         let (tx, rx) = mpsc::channel();
-        let index_path_clone = index_path.clone();
-        thread::spawn(move || {
-            background_index(index_path_clone, state_path, tx);
-        });
 
         let initial_cursor = initial_query.chars().count();
         let mut app = Self {
@@ -157,8 +163,11 @@ impl App {
             index,
             status: None,
             total_sessions: 0,
-            index_rx: Some(rx),
-            indexing: true,
+            index_rx: rx,
+            index_tx: tx,
+            index_path,
+            state_path,
+            indexing: false,
             search_scope: match initial_scope {
                 InitialSearchScope::Folder => SearchScope::Folder(launch_cwd.clone()),
                 InitialSearchScope::Everything => SearchScope::Everything,
@@ -167,7 +176,10 @@ impl App {
             search_pending: false,
             last_input: Instant::now(),
             index_error: None,
+            next_refresh_at: Instant::now(),
         };
+
+        app.request_refresh();
 
         // If there's an initial query, run the search immediately
         if !app.query.is_empty() {
@@ -181,15 +193,11 @@ impl App {
     pub fn poll_index_updates(&mut self) {
         use std::sync::mpsc::TryRecvError;
 
-        let Some(rx) = &self.index_rx else {
-            return;
-        };
-
         // Collect messages, tracking if channel was disconnected
         let mut messages = Vec::new();
         let mut channel_disconnected = false;
         loop {
-            match rx.try_recv() {
+            match self.index_rx.try_recv() {
                 Ok(msg) => messages.push(msg),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -199,9 +207,8 @@ impl App {
             }
         }
 
-        let mut should_close_rx = false;
         let mut needs_reload = false;
-        let mut needs_search = false;
+        let mut needs_results_refresh = false;
 
         for msg in messages {
             match msg {
@@ -211,21 +218,21 @@ impl App {
                 }
                 IndexMsg::NeedsReload => {
                     needs_reload = true;
-                    needs_search = true;
+                    needs_results_refresh = true;
                 }
                 IndexMsg::Done { total_sessions } => {
                     self.total_sessions = total_sessions;
                     self.status = None;
                     self.indexing = false;
-                    should_close_rx = true;
+                    self.next_refresh_at = Instant::now() + REFRESH_INTERVAL;
                     needs_reload = true;
-                    needs_search = true;
+                    needs_results_refresh = true;
                 }
                 IndexMsg::Error(err) => {
                     self.index_error = Some(err);
                     self.status = Some("Index error • Ctrl+C for details".to_string());
                     self.indexing = false;
-                    should_close_rx = true;
+                    self.next_refresh_at = Instant::now() + REFRESH_INTERVAL;
                 }
             }
         }
@@ -235,17 +242,36 @@ impl App {
             self.index_error = Some("Indexer stopped unexpectedly (possible crash)".to_string());
             self.status = Some("Index error • Ctrl+C for details".to_string());
             self.indexing = false;
-            should_close_rx = true;
+            self.next_refresh_at = Instant::now() + REFRESH_INTERVAL;
         }
 
         if needs_reload {
             let _ = self.index.reload();
         }
-        if needs_search {
-            let _ = self.search();
+        if needs_results_refresh {
+            let _ = self.refresh_results_preserving_browse();
         }
-        if should_close_rx {
-            self.index_rx = None;
+    }
+
+    /// Start an immediate background refresh, returning false when one is already running.
+    pub fn request_refresh(&mut self) -> bool {
+        if self.indexing {
+            return false;
+        }
+
+        self.indexing = true;
+        self.status = Some("Refreshing...".to_string());
+        let index_path = self.index_path.clone();
+        let state_path = self.state_path.clone();
+        let tx = self.index_tx.clone();
+        thread::spawn(move || background_index(index_path, state_path, tx));
+        true
+    }
+
+    /// Begin an automatic refresh after the configured interval has elapsed.
+    pub fn maybe_refresh(&mut self) {
+        if !self.indexing && Instant::now() >= self.next_refresh_at {
+            self.request_refresh();
         }
     }
 
@@ -283,6 +309,44 @@ impl App {
         }
         self.update_preview_scroll();
 
+        Ok(())
+    }
+
+    /// Recompute results after indexing without disturbing an active browse session.
+    fn refresh_results_preserving_browse(&mut self) -> Result<()> {
+        let selected_session_id = self.results.get(self.selected).map(|r| r.session.id.clone());
+        let previous_selected = self.selected;
+        let previous_list_scroll = self.list_scroll;
+
+        let mut results = if self.query.is_empty() {
+            self.index.recent(50)?
+        } else {
+            self.index.search(&self.query, 50)?
+        };
+        if let SearchScope::Folder(ref cwd) = self.search_scope {
+            results.retain(|r| r.session.cwd == *cwd);
+        }
+        self.results = results;
+
+        if let Some(id) = selected_session_id {
+            if let Some(position) = self.results.iter().position(|r| r.session.id == id) {
+                self.selected = position;
+                self.list_scroll = previous_list_scroll;
+                return Ok(());
+            }
+        }
+
+        if self.results.is_empty() {
+            self.selected = 0;
+            self.list_scroll = 0;
+            self.focused_message = None;
+            self.expanded_messages.clear();
+            self.preview_scroll = 0;
+        } else {
+            self.selected = previous_selected.min(self.results.len() - 1);
+            self.list_scroll = previous_list_scroll;
+            self.update_preview_scroll();
+        }
         Ok(())
     }
 
@@ -702,13 +766,17 @@ mod tests {
             index: SessionIndex::open_or_create(&index_path).unwrap(),
             status: None,
             total_sessions: 0,
-            index_rx: None,
+            index_rx: mpsc::channel().1,
+            index_tx: mpsc::channel().0,
+            index_path,
+            state_path: std::env::temp_dir().join(format!("recall_test_state_{}.json", test_id)),
             indexing: false,
             search_scope: SearchScope::Everything,
             launch_cwd: String::new(),
             search_pending: false,
             last_input: Instant::now(),
             index_error: None,
+            next_refresh_at: Instant::now() + REFRESH_INTERVAL,
         }
     }
 
