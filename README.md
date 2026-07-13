@@ -8,22 +8,16 @@ Search and resume your Claude Code conversations. Also supports Codex, OpenCode 
 
 ## Install
 
-**Homebrew** (macOS/Linux):
+This personal fork is source-only: build it locally, then install only if you choose to:
+
 ```bash
-brew install zippoxer/tap/recall
+git clone https://github.com/plinde/recall.git
+cd recall
+make build
+make install
 ```
 
-**WinGet** (Windows):
-```bash
-winget install zippoxer.recall
-```
-
-**Cargo**:
-```bash
-cargo install --git https://github.com/zippoxer/recall
-```
-
-**Binary**: Download from [Releases](https://github.com/zippoxer/recall/releases)
+`make install` is intentionally separate; it copies the locally built binary to `~/.local/bin`.
 
 ## Use
 
