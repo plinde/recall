@@ -364,6 +364,71 @@ fn test_toggle_scope() {
 }
 
 #[test]
+fn test_manual_refresh_preserves_scope_and_browse_state() {
+    let _lock = lock_test();
+    let temp_dir = setup_test_env();
+    std::env::set_var("RECALL_HOME_OVERRIDE", temp_dir.path());
+    std::env::set_var("RECALL_CWD_OVERRIDE", "/projects/webapp");
+
+    let mut app = recall::App::new(String::new()).unwrap();
+    wait_for_indexing(&mut app, 100);
+    app.toggle_scope();
+    assert!(matches!(app.search_scope, recall::SearchScope::Folder(_)));
+
+    app.selected = 0;
+    let selected_id = app.results[app.selected].session.id.clone();
+    app.list_scroll = 3;
+    app.preview_scroll = 7;
+    app.focused_message = Some(1);
+    app.expanded_messages.insert(1);
+
+    assert!(app.request_refresh());
+    assert!(!app.request_refresh(), "a second refresh must not overlap");
+    wait_for_indexing(&mut app, 100);
+
+    assert!(matches!(app.search_scope, recall::SearchScope::Folder(_)));
+    assert_eq!(app.results[app.selected].session.id, selected_id);
+    assert_eq!(app.list_scroll, 3);
+    assert_eq!(app.preview_scroll, 7);
+    assert_eq!(app.focused_message, Some(1));
+    assert!(app.expanded_messages.contains(&1));
+
+    std::env::remove_var("RECALL_HOME_OVERRIDE");
+    std::env::remove_var("RECALL_CWD_OVERRIDE");
+}
+
+#[test]
+fn test_manual_refresh_discovers_new_session() {
+    let _lock = lock_test();
+    let temp_dir = setup_test_env();
+    std::env::set_var("RECALL_HOME_OVERRIDE", temp_dir.path());
+
+    let mut app = recall::App::new("refreshneedle".to_string()).unwrap();
+    wait_for_indexing(&mut app, 100);
+    assert!(app.results.is_empty());
+
+    let source = temp_dir.path().join(".codex/sessions/test-codex.jsonl");
+    let refreshed = std::fs::read_to_string(source)
+        .unwrap()
+        .replace("test-codex-456", "test-codex-refresh")
+        .replace("search for all TypeScript files", "refreshneedle");
+    std::fs::write(
+        temp_dir.path().join(".codex/sessions/test-codex-refresh.jsonl"),
+        refreshed,
+    )
+    .unwrap();
+
+    assert!(app.request_refresh());
+    wait_for_indexing(&mut app, 100);
+    assert!(app
+        .results
+        .iter()
+        .any(|result| result.session.id == "test-codex-refresh"));
+
+    std::env::remove_var("RECALL_HOME_OVERRIDE");
+}
+
+#[test]
 fn test_initial_everywhere_scope() {
     let _lock = lock_test();
     let temp_dir = setup_test_env();

@@ -221,6 +221,9 @@ fn run(terminal: &mut tui::Tui, app: &mut App) -> Result<()> {
         // Poll for indexing updates
         app.poll_index_updates();
 
+        // Keep the index current without blocking history browsing.
+        app.maybe_refresh();
+
         // Check for debounced search
         app.maybe_search();
 
@@ -259,6 +262,9 @@ fn run(terminal: &mut tui::Tui, app: &mut App) -> Result<()> {
                     }
                     KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.toggle_scope();
+                    }
+                    KeyCode::Char('r') if key.modifiers == KeyModifiers::CONTROL => {
+                        app.request_refresh();
                     }
                     KeyCode::Char('/') => app.toggle_scope(),
                     KeyCode::Char(c) => app.on_char(c),
