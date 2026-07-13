@@ -100,10 +100,10 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     let label_color = t.scope_label_fg;
     let scope_widget = vec![
         Span::styled(" │ ", Style::default().fg(separator_color)),  // separator
-        Span::styled(" / ", Style::default().bg(t.keycap_bg)),  // keycap like status bar
+        Span::styled(" ^G ", Style::default().bg(t.keycap_bg)),  // keycap like status bar
         Span::styled(format!(" {} ", scope_label), Style::default().fg(label_color)),  // label
     ];
-    let scope_width: usize = 3 + 3 + 1 + scope_label.len() + 1; // " │ " + " / " + " label "
+    let scope_width: usize = 3 + 4 + 1 + scope_label.len() + 1; // " │ " + " ^G " + " label "
 
     // Calculate how much space for search text (leave room for scope widget + left margin)
     let search_width = (area.width as usize).saturating_sub(scope_width + 1); // +1 for left margin before widget
@@ -180,7 +180,7 @@ fn render_results_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let prefix = if app.query.is_empty() { "Nothing here." } else { "No results." };
             let hint = Line::from(vec![
                 Span::styled(format!(" {} Press ", prefix), Style::default().fg(t.snippet_fg)),
-                Span::styled(" / ", Style::default().bg(t.keycap_bg)),
+                Span::styled(" ^G ", Style::default().bg(t.keycap_bg)),
                 Span::styled(" to search everywhere.", Style::default().fg(t.snippet_fg)),
             ]);
             frame.render_widget(Paragraph::new(hint), area);
@@ -311,12 +311,12 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     // Extract values we need before mutating app
-    let file_path = result.session.file_path.clone();
+    let locator = crate::parser::SessionLocator::from_session(&result.session);
     let matched_message_index = result.matched_message_index;
     let match_fragment = result.match_fragment.clone();
 
     // Load the full session for preview
-    let session = match crate::parser::parse_session_file(&file_path) {
+    let session = match crate::parser::parse_session(&locator) {
         Ok(s) => s,
         Err(_) => {
             app.message_line_ranges.clear();
@@ -502,9 +502,16 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(msg, Style::default().fg(t.match_fg)))
     } else {
         let has_selection = !app.results.is_empty();
+        let scope_action = match &app.search_scope {
+            SearchScope::Everything => " cwd ",
+            SearchScope::Folder(_) => " global ",
+        };
         let mut spans = vec![
             Span::styled(" ↑↓ ", keycap),
             Span::styled(" navigate ", label),
+            Span::styled(" │ ", dim),
+            Span::styled(" ^G ", keycap),
+            Span::styled(scope_action, label),
         ];
         // Show Enter/Tab only when there's a selection
         if has_selection {

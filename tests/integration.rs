@@ -1,5 +1,6 @@
 use insta::assert_snapshot;
 use ratatui::{backend::TestBackend, Terminal};
+use rusqlite::{params, Connection};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -36,6 +37,92 @@ fn setup_test_env() -> TempDir {
     copy_dir_recursive(&codex_src, &codex_dst);
 
     temp_dir
+}
+
+fn create_opencode_database(home: &std::path::Path) -> PathBuf {
+    let root = home.join(".local/share/opencode");
+    create_opencode_database_at(&root)
+}
+
+fn create_opencode_database_at(root: &std::path::Path) -> PathBuf {
+    std::fs::create_dir_all(root).unwrap();
+    let database = root.join("opencode.db");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+    for (session, message, updated, text) in [
+        ("ses_sqlite_a", "msg_sqlite_a", 2_000_i64, "sqlite alpha needle"),
+        ("ses_sqlite_b", "msg_sqlite_b", 3_000_i64, "sqlite beta needle"),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, NULL, '/sqlite/project', 1000, ?2)",
+                params![session, updated],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, 1500, ?3)",
+                params![message, session, r#"{"role":"user"}"#],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO part VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    format!("prt_{session}"),
+                    message,
+                    session,
+                    serde_json::json!({"type": "text", "text": text}).to_string()
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO session VALUES ('ses_sqlite_child', 'ses_sqlite_a', '/sqlite/project', 1000, 9000)",
+            [],
+        )
+        .unwrap();
+    database
+}
+
+fn create_legacy_opencode_session(home: &std::path::Path) -> PathBuf {
+    let storage = home.join(".local/share/opencode/storage");
+    let session = storage.join("session/project/ses_legacy.json");
+    std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(storage.join("message/ses_legacy")).unwrap();
+    std::fs::create_dir_all(storage.join("part/msg_legacy")).unwrap();
+    std::fs::write(
+        &session,
+        r#"{"id":"ses_legacy","directory":"/legacy/project","time":{"created":1000}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        storage.join("message/ses_legacy/msg_legacy.json"),
+        r#"{"id":"msg_legacy","sessionID":"ses_legacy","role":"user","time":{"created":1100}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        storage.join("part/msg_legacy/prt_legacy.json"),
+        r#"{"id":"prt_legacy","type":"text","text":"legacy pruning needle"}"#,
+    )
+    .unwrap();
+    session
 }
 
 /// Recursively copy a directory
@@ -154,9 +241,6 @@ fn test_search_finds_matching_content() {
     let mut app = recall::App::new(String::new()).unwrap();
     wait_for_indexing(&mut app, 100);
 
-    // Toggle to everywhere scope (CWD won't match fixtures)
-    app.toggle_scope();
-
     // Search for content from Claude fixture
     for c in "hello".chars() {
         app.on_char(c);
@@ -181,9 +265,8 @@ fn test_search_no_results_shows_hint() {
     let mut app = recall::App::new(String::new()).unwrap();
     wait_for_indexing(&mut app, 100);
 
-    // Toggle to everywhere then back to folder scope to ensure we're scoped
-    app.toggle_scope(); // now everywhere
-    app.toggle_scope(); // now folder
+    // Toggle from the default everywhere scope to folder scope.
+    app.toggle_scope();
 
     // Search for something that doesn't exist
     for c in "xyznonexistent".chars() {
@@ -212,9 +295,6 @@ fn test_navigation_up_down() {
     let mut app = recall::App::new(String::new()).unwrap();
     wait_for_indexing(&mut app, 100);
 
-    // Toggle to everywhere to see all sessions
-    app.toggle_scope();
-
     std::env::remove_var("RECALL_HOME_OVERRIDE");
 
     if app.results.len() >= 2 {
@@ -232,23 +312,73 @@ fn test_navigation_up_down() {
 fn test_toggle_scope() {
     let _lock = lock_test();
     let temp_dir = setup_test_env();
+    let codex_session = temp_dir.path().join(".codex/sessions/test-codex.jsonl");
+    let newer_codex_session = std::fs::read_to_string(&codex_session)
+        .unwrap()
+        .replace("test-codex-456", "test-codex-789")
+        .replace("2025-01-16", "2025-01-17");
+    std::fs::write(
+        temp_dir.path().join(".codex/sessions/test-codex-newer.jsonl"),
+        newer_codex_session,
+    )
+    .unwrap();
+    std::env::set_var("RECALL_HOME_OVERRIDE", temp_dir.path());
+    std::env::set_var("RECALL_CWD_OVERRIDE", "/projects/webapp");
+
+    let mut app = recall::App::new(String::new()).unwrap();
+    wait_for_indexing(&mut app, 100);
+
+    // Should start in global scope.
+    assert!(matches!(app.search_scope, recall::SearchScope::Everything));
+
+    app.selected = app
+        .results
+        .iter()
+        .position(|result| result.session.id == "test-codex-456")
+        .unwrap();
+    assert!(app.selected > 0, "older CWD session should not be globally first");
+    app.list_scroll = app.selected;
+
+    // Toggle to the launch directory.
+    app.toggle_scope();
+    assert!(matches!(app.search_scope, recall::SearchScope::Folder(_)));
+    assert_eq!(app.selected, 0);
+    assert_eq!(app.list_scroll, 0);
+
+    app.selected = app
+        .results
+        .iter()
+        .position(|result| result.session.id == "test-codex-456")
+        .unwrap();
+    assert!(app.selected > 0, "older CWD session should not be CWD first");
+    app.list_scroll = app.selected;
+
+    // Toggle back to global.
+    app.toggle_scope();
+    assert!(matches!(app.search_scope, recall::SearchScope::Everything));
+    assert_eq!(app.selected, 0);
+    assert_eq!(app.list_scroll, 0);
+
+    std::env::remove_var("RECALL_HOME_OVERRIDE");
+    std::env::remove_var("RECALL_CWD_OVERRIDE");
+}
+
+#[test]
+fn test_initial_everywhere_scope() {
+    let _lock = lock_test();
+    let temp_dir = setup_test_env();
     std::env::set_var("RECALL_HOME_OVERRIDE", temp_dir.path());
 
     let mut app = recall::App::new(String::new()).unwrap();
     wait_for_indexing(&mut app, 100);
 
-    // Should start in folder scope
-    assert!(matches!(app.search_scope, recall::SearchScope::Folder(_)));
-
-    // Toggle to everywhere
-    app.toggle_scope();
-    assert!(matches!(app.search_scope, recall::SearchScope::Everything));
-
-    // Toggle back
-    app.toggle_scope();
-    assert!(matches!(app.search_scope, recall::SearchScope::Folder(_)));
-
     std::env::remove_var("RECALL_HOME_OVERRIDE");
+
+    assert!(matches!(app.search_scope, recall::SearchScope::Everything));
+    assert!(
+        !app.results.is_empty(),
+        "Everywhere scope should show fixtures outside the launch directory"
+    );
 }
 
 #[test]
@@ -269,6 +399,8 @@ fn test_renders_status_bar() {
         buffer_contains(&terminal, "sessions"),
         "Should show session count in status bar"
     );
+    assert!(buffer_contains(&terminal, "^G"));
+    assert!(buffer_contains(&terminal, "cwd"));
 }
 
 #[test]
@@ -384,10 +516,14 @@ fn test_ui_no_query_folder_scope() {
     let _lock = lock_test();
     let _temp_dir = setup_ui_test();
 
-    let mut app = recall::App::new(String::new()).unwrap();
+    let mut app = recall::App::new_with_scope(
+        String::new(),
+        recall::InitialSearchScope::Folder,
+    )
+    .unwrap();
     wait_for_indexing(&mut app, 100);
 
-    // Stay in folder scope (no sessions match CWD)
+    // Stay in folder scope (no sessions match CWD).
     let terminal = render_app(&mut app);
 
     cleanup_ui_test();
@@ -406,11 +542,12 @@ fn test_ui_no_query_everywhere_scope() {
     std::env::set_var("RECALL_HOME_OVERRIDE", temp_dir.path());
     std::env::set_var("RECALL_CWD_OVERRIDE", TEST_CWD);
 
-    let mut app = recall::App::new(String::new()).unwrap();
+    let mut app = recall::App::new_with_scope(
+        String::new(),
+        recall::InitialSearchScope::Everything,
+    )
+    .unwrap();
     wait_for_indexing(&mut app, 100);
-
-    // Toggle to everywhere scope
-    app.toggle_scope();
 
     let terminal = render_app(&mut app);
 
@@ -424,10 +561,14 @@ fn test_ui_with_query_folder_scope_no_results() {
     let _lock = lock_test();
     let _temp_dir = setup_ui_test();
 
-    let mut app = recall::App::new(String::new()).unwrap();
+    let mut app = recall::App::new_with_scope(
+        String::new(),
+        recall::InitialSearchScope::Folder,
+    )
+    .unwrap();
     wait_for_indexing(&mut app, 100);
 
-    // Stay in folder scope and search
+    // Stay in folder scope and search.
     for c in "zzzznotfound".chars() {
         app.on_char(c);
     }
@@ -448,8 +589,7 @@ fn test_ui_with_query_everywhere_scope_no_results() {
     let mut app = recall::App::new(String::new()).unwrap();
     wait_for_indexing(&mut app, 100);
 
-    // Toggle to everywhere and search for something that doesn't exist
-    app.toggle_scope();
+    // Stay in the default everywhere scope and search for something that doesn't exist.
     for c in "zzzznotfound".chars() {
         app.on_char(c);
     }
@@ -731,4 +871,235 @@ fn test_cli_list_with_cwd_filter() {
     for session in sessions {
         assert_eq!(session["cwd"], "/test/project");
     }
+}
+
+#[test]
+fn test_opencode_sqlite_cli_search_list_read_and_session_scope() {
+    let _lock = lock_test();
+    let temp_dir = TempDir::new().unwrap();
+    create_opencode_database(temp_dir.path());
+
+    let (stdout, stderr, success) = run_cli(
+        &["search", "alpha", "--source", "opencode"],
+        temp_dir.path(),
+    );
+    assert!(success, "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["results"][0]["session_id"], "ses_sqlite_a");
+    assert_eq!(json["results"][0]["source"], "opencode");
+    assert_eq!(json["results"][0]["cwd"], "/sqlite/project");
+    assert_eq!(
+        json["results"][0]["resume_command"],
+        "opencode --session ses_sqlite_a"
+    );
+
+    let (stdout, stderr, success) = run_cli(
+        &["search", "needle", "--session", "ses_sqlite_b"],
+        temp_dir.path(),
+    );
+    assert!(success, "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["results"][0]["session_id"], "ses_sqlite_b");
+
+    let (stdout, stderr, success) = run_cli(&["read", "ses_sqlite_a"], temp_dir.path());
+    assert!(success, "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["messages"][0]["content"], "sqlite alpha needle");
+    assert_eq!(json["timestamp"], "1970-01-01T00:00:02Z");
+
+    let (stdout, stderr, success) = run_cli(
+        &["list", "--source", "opencode", "--limit", "10"],
+        temp_dir.path(),
+    );
+    assert!(success, "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let ids: Vec<_> = json["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|session| session["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["ses_sqlite_b", "ses_sqlite_a"]);
+    assert!(!ids.contains(&"ses_sqlite_child"));
+}
+
+#[test]
+fn test_opencode_uses_xdg_data_home() {
+    let _lock = lock_test();
+    let temp_dir = TempDir::new().unwrap();
+    let database = create_opencode_database_at(&temp_dir.path().join("opencode"));
+    let previous = std::env::var_os("XDG_DATA_HOME");
+    std::env::remove_var("RECALL_HOME_OVERRIDE");
+    std::env::set_var("XDG_DATA_HOME", temp_dir.path());
+
+    let sessions = recall::parser::discover_sessions();
+
+    if let Some(previous) = previous {
+        std::env::set_var("XDG_DATA_HOME", previous);
+    } else {
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+    assert!(sessions.iter().any(|session| {
+        session.path == database
+            && session.database_session_id.as_deref() == Some("ses_sqlite_a")
+    }));
+}
+
+#[test]
+fn test_deleted_legacy_opencode_file_is_pruned() {
+    let _lock = lock_test();
+    let temp_dir = TempDir::new().unwrap();
+    let session_file = create_legacy_opencode_session(temp_dir.path());
+
+    let (stdout, stderr, success) = run_cli(&["search", "legacy"], temp_dir.path());
+    assert!(success, "{stderr}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["results"][0]["session_id"],
+        "ses_legacy"
+    );
+
+    std::fs::remove_file(session_file).unwrap();
+    let (stdout, stderr, success) = run_cli(&["search", "legacy"], temp_dir.path());
+    assert!(success, "{stderr}");
+    assert!(serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(temp_dir.path().join(".cache/recall/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(state["indexed_sessions"].as_object().unwrap().is_empty());
+}
+
+#[test]
+fn test_opencode_sqlite_updates_independently_and_prunes_rows_and_database() {
+    let _lock = lock_test();
+    let temp_dir = TempDir::new().unwrap();
+    let database = create_opencode_database(temp_dir.path());
+
+    let (_, stderr, success) = run_cli(&["list"], temp_dir.path());
+    assert!(success, "{stderr}");
+    let state_path = temp_dir.path().join(".cache/recall/state.json");
+    let initial: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let beta_key = initial["indexed_sessions"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .find(|key| key.contains("ses_sqlite_b"))
+        .unwrap()
+        .clone();
+    let beta_state = initial["indexed_sessions"][&beta_key].clone();
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE session SET time_updated = 4000 WHERE id = 'ses_sqlite_a'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE part SET data = ?1 WHERE session_id = 'ses_sqlite_a'",
+            [serde_json::json!({"type": "text", "text": "independent update"}).to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let (stdout, stderr, success) = run_cli(&["search", "independent"], temp_dir.path());
+    assert!(success, "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["results"][0]["session_id"], "ses_sqlite_a");
+    let updated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(updated["indexed_sessions"][&beta_key], beta_state);
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute("DELETE FROM part WHERE session_id = 'ses_sqlite_a'", [])
+        .unwrap();
+    connection
+        .execute("DELETE FROM message WHERE session_id = 'ses_sqlite_a'", [])
+        .unwrap();
+    connection
+        .execute("DELETE FROM session WHERE id = 'ses_sqlite_a'", [])
+        .unwrap();
+    drop(connection);
+    let (stdout, stderr, success) = run_cli(&["search", "independent"], temp_dir.path());
+    assert!(success, "{stderr}");
+    assert!(serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let pruned: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert!(!pruned["indexed_sessions"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .any(|key| key.contains("ses_sqlite_a")));
+
+    std::fs::remove_file(database).unwrap();
+    let (stdout, stderr, success) = run_cli(
+        &["list", "--source", "opencode", "--limit", "10"],
+        temp_dir.path(),
+    );
+    assert!(success, "{stderr}");
+    assert!(serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let pruned: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert!(pruned["indexed_sessions"].as_object().unwrap().is_empty());
+}
+
+#[test]
+fn test_unloadable_opencode_selection_shows_status_error() {
+    let _lock = lock_test();
+    let temp_dir = TempDir::new().unwrap();
+    let database = create_opencode_database(temp_dir.path());
+    std::env::set_var("RECALL_HOME_OVERRIDE", temp_dir.path());
+    let mut app = recall::App::new("alpha".to_string()).unwrap();
+    wait_for_indexing(&mut app, 100);
+    app.search().unwrap();
+    assert_eq!(app.results[0].session.id, "ses_sqlite_a");
+    std::fs::remove_file(database).unwrap();
+    app.on_enter();
+    std::env::remove_var("RECALL_HOME_OVERRIDE");
+
+    let status = app.status.unwrap();
+    assert!(status.contains("Cannot load OpenCode session ses_sqlite_a"));
+    assert!(status.contains("opencode.db"));
+    assert!(app.should_resume.is_none());
+}
+
+#[test]
+fn test_tui_background_indexing_prunes_deleted_sqlite_row() {
+    let _lock = lock_test();
+    let temp_dir = TempDir::new().unwrap();
+    let database = create_opencode_database(temp_dir.path());
+    std::env::set_var("RECALL_HOME_OVERRIDE", temp_dir.path());
+    let mut initial = recall::App::new(String::new()).unwrap();
+    wait_for_indexing(&mut initial, 100);
+    drop(initial);
+
+    let connection = Connection::open(database).unwrap();
+    connection
+        .execute("DELETE FROM part WHERE session_id = 'ses_sqlite_a'", [])
+        .unwrap();
+    connection
+        .execute("DELETE FROM message WHERE session_id = 'ses_sqlite_a'", [])
+        .unwrap();
+    connection
+        .execute("DELETE FROM session WHERE id = 'ses_sqlite_a'", [])
+        .unwrap();
+    drop(connection);
+
+    let mut app = recall::App::new("alpha".to_string()).unwrap();
+    wait_for_indexing(&mut app, 100);
+    app.search().unwrap();
+    std::env::remove_var("RECALL_HOME_OVERRIDE");
+    assert!(app.results.is_empty());
 }

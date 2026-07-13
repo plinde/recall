@@ -2,13 +2,11 @@
 source: tests/integration.rs
 expression: buffer_to_string(&terminal)
 ---
-                                                               │
-  Search...                                                    │  /  /test/cwd
-                                                               │
+                                                              │
+  Search...                                                   │  ^G  /test/cwd
+                                                              │
 
-  Nothing here. Press  /  to search everywhere.
-
-
+  Nothing here. Press  ^G  to search everywhere.
 
 
 
@@ -25,4 +23,6 @@ expression: buffer_to_string(&terminal)
 
 
 
-  ↑↓  navigate  │  Esc  quit                                         2 sessions
+
+
+  ↑↓  navigate  │  ^G  global  │  Esc  quit                          2 sessions

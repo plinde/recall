@@ -1,4 +1,7 @@
-use crate::index::{discover_and_sort_files, index_files, IndexProgress, IndexState, SessionIndex};
+use crate::index::{
+    discover_and_sort_files, index_files, prune_stale_sessions, IndexProgress, IndexState,
+    SessionIndex,
+};
 use crate::parser;
 use crate::session::{SearchResult, Session};
 use anyhow::Result;
@@ -26,6 +29,15 @@ pub enum SearchScope {
     Everything,
     /// Search only conversations from a specific folder
     Folder(String),
+}
+
+/// Scope used when a TUI session starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialSearchScope {
+    /// Limit results to the directory where recall was launched.
+    Folder,
+    /// Search across all indexed conversations.
+    Everything,
 }
 
 pub struct App {
@@ -87,6 +99,14 @@ pub struct App {
 
 impl App {
     pub fn new(initial_query: String) -> Result<Self> {
+        Self::new_with_scope(initial_query, InitialSearchScope::Everything)
+    }
+
+    /// Create a new app with an explicit initial search scope.
+    pub fn new_with_scope(
+        initial_query: String,
+        initial_scope: InitialSearchScope,
+    ) -> Result<Self> {
         // Allow override for testing
         let cache_dir = std::env::var("RECALL_HOME_OVERRIDE")
             .map(|h| PathBuf::from(h).join(".cache").join("recall"))
@@ -139,7 +159,10 @@ impl App {
             total_sessions: 0,
             index_rx: Some(rx),
             indexing: true,
-            search_scope: SearchScope::Folder(launch_cwd.clone()),
+            search_scope: match initial_scope {
+                InitialSearchScope::Folder => SearchScope::Folder(launch_cwd.clone()),
+                InitialSearchScope::Everything => SearchScope::Everything,
+            },
             launch_cwd,
             search_pending: false,
             last_input: Instant::now(),
@@ -270,6 +293,11 @@ impl App {
             SearchScope::Folder(_) => SearchScope::Everything,
         };
         let _ = self.search();
+
+        // A new scope is a new result set; always start at its most recent result.
+        self.selected = 0;
+        self.list_scroll = 0;
+        self.update_preview_scroll();
     }
 
     /// Get the folder name for display (last component of path)
@@ -433,8 +461,18 @@ impl App {
     /// Handle Enter key - open conversation
     pub fn on_enter(&mut self) {
         if let Some(result) = self.results.get(self.selected) {
-            if let Ok(session) = parser::parse_session_file(&result.session.file_path) {
-                self.should_resume = Some(session);
+            let locator = parser::SessionLocator::from_session(&result.session);
+            match parser::parse_session(&locator) {
+                Ok(session) => self.should_resume = Some(session),
+                Err(error) => {
+                    self.status = Some(format!(
+                        "Cannot load {} session {} from {}: {}",
+                        result.session.source.display_name(),
+                        result.session.id,
+                        result.session.file_path.display(),
+                        error
+                    ));
+                }
             }
         }
     }
@@ -565,7 +603,10 @@ fn background_index(index_path: PathBuf, state_path: PathBuf, tx: Sender<IndexMs
         .cloned()
         .collect();
 
-    if files_to_index.is_empty() {
+    let rebuild = state.take_rebuild_required();
+    let known: std::collections::HashSet<_> = files.iter().map(|f| f.identity.as_str()).collect();
+    let has_stale = state.identities().any(|id| !known.contains(id.as_str()));
+    if files_to_index.is_empty() && !has_stale && !rebuild {
         let _ = tx.send(IndexMsg::Done {
             total_sessions: files.len(),
         });
@@ -579,6 +620,13 @@ fn background_index(index_path: PathBuf, state_path: PathBuf, tx: Sender<IndexMs
             return;
         }
     };
+    if rebuild {
+        if let Err(e) = index.clear(&mut writer) {
+            let _ = tx.send(IndexMsg::Error(format!("Failed to rebuild index: {}", e)));
+            return;
+        }
+    }
+    prune_stale_sessions(&index, &mut writer, &mut state, &files);
 
     // Progress callback sends to channel
     let tx_progress = tx.clone();
@@ -595,14 +643,19 @@ fn background_index(index_path: PathBuf, state_path: PathBuf, tx: Sender<IndexMs
         let _ = tx_reload.send(IndexMsg::NeedsReload);
     });
 
-    let result = index_files(
-        &index,
-        &mut writer,
-        &mut state,
-        &files_to_index,
-        Some(on_progress),
-        Some(on_reload),
-    );
+    let result = if files_to_index.is_empty() {
+        writer.commit().map(|_| ()).map_err(Into::into)
+    } else {
+        index_files(
+            &index,
+            &mut writer,
+            &mut state,
+            &files_to_index,
+            Some(on_progress),
+            Some(on_reload),
+        )
+        .map(|_| ())
+    };
 
     if let Err(e) = result {
         let _ = tx.send(IndexMsg::Error(format!("Indexing failed: {}", e)));

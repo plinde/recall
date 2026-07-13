@@ -2,9 +2,9 @@
 source: tests/integration.rs
 expression: buffer_to_string(&terminal)
 ---
-                                                              │
-  Search...                                                   │  /  everywhere
-                                                              │
+                                                             │
+  Search...                                                  │  ^G  everywhere
+                                                             │
 
 
 
@@ -25,4 +25,4 @@ expression: buffer_to_string(&terminal)
 
 
 
-  ↑↓  navigate  │  Esc  quit                                         0 sessions
+  ↑↓  navigate  │  ^G  cwd  │  Esc  quit                             0 sessions

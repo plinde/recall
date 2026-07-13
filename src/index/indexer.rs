@@ -2,9 +2,9 @@
 
 use super::state::IndexState;
 use super::SessionIndex;
-use crate::parser;
+use crate::parser::{self, SessionLocator};
 use anyhow::Result;
-use std::path::PathBuf;
+use std::collections::HashSet;
 use tantivy::IndexWriter;
 
 /// Progress information during indexing
@@ -19,19 +19,31 @@ pub type ProgressCallback = Box<dyn FnMut(IndexProgress) + Send>;
 /// Callback for notifying that the index should be reloaded
 pub type ReloadCallback = Box<dyn FnMut() + Send>;
 
-/// Discovers session files and sorts them by modification time (most recent first)
-pub fn discover_and_sort_files() -> Vec<PathBuf> {
-    let mut files = parser::discover_session_files();
-    files.sort_by(|a, b| {
-        let mtime_a = std::fs::metadata(a)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let mtime_b = std::fs::metadata(b)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        mtime_b.cmp(&mtime_a) // Descending (most recent first)
-    });
-    files
+/// Discovers sessions and sorts them by their source-specific timestamp.
+pub fn discover_and_sort_files() -> Vec<SessionLocator> {
+    let mut locators = parser::discover_sessions();
+    locators.sort_by_key(|locator| std::cmp::Reverse(locator.sort_timestamp));
+    locators
+}
+
+/// Remove sessions which are no longer present, including missing SQLite rows.
+pub fn prune_stale_sessions(
+    index: &SessionIndex,
+    writer: &mut IndexWriter,
+    state: &mut IndexState,
+    discovered: &[SessionLocator],
+) -> usize {
+    let discovered: HashSet<&str> = discovered.iter().map(|item| item.identity.as_str()).collect();
+    let stale: Vec<String> = state
+        .identities()
+        .filter(|identity| !discovered.contains(identity.as_str()))
+        .cloned()
+        .collect();
+    for identity in &stale {
+        index.delete_session(writer, identity);
+        state.remove(identity);
+    }
+    stale.len()
 }
 
 /// Index a batch of files, calling progress callbacks as work proceeds.
@@ -44,30 +56,31 @@ pub fn index_files(
     index: &SessionIndex,
     writer: &mut IndexWriter,
     state: &mut IndexState,
-    files: &[PathBuf],
+    files: &[SessionLocator],
     mut on_progress: Option<ProgressCallback>,
     mut on_reload: Option<ReloadCallback>,
 ) -> Result<usize> {
     let total = files.len();
     let mut indexed = 0;
 
-    for (i, file_path) in files.iter().enumerate() {
+    for (i, locator) in files.iter().enumerate() {
         // Delete existing documents for this file (in case of update)
-        index.delete_session(writer, file_path);
+        index.delete_session(writer, &locator.identity);
 
         // Parse and index
-        match parser::parse_session_file(file_path) {
+        match parser::parse_session(locator) {
             Ok(session) => {
                 if !session.messages.is_empty() {
                     let _ = index.index_session(writer, &session);
                 }
                 // Mark as indexed even if empty (so we don't reprocess it)
-                state.mark_indexed(file_path);
+                state.mark_indexed(locator);
                 indexed += 1;
             }
             Err(_) => {
                 // Skip failed files (they might be incomplete/corrupted)
                 // Don't mark as indexed so we retry next time
+                state.remove(&locator.identity);
             }
         }
 

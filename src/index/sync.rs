@@ -1,6 +1,6 @@
 //! Synchronous indexing for CLI mode
 
-use super::indexer::{discover_and_sort_files, index_files, IndexProgress};
+use super::indexer::{discover_and_sort_files, index_files, prune_stale_sessions, IndexProgress};
 use super::schema::default_index_path;
 use super::state::IndexState;
 use super::SessionIndex;
@@ -31,8 +31,10 @@ pub fn ensure_index_fresh(index: &SessionIndex) -> Result<()> {
         .collect();
 
     let total = files_to_index.len();
-    if total == 0 {
-        // Nothing to index, we're fresh
+    let rebuild = state.take_rebuild_required();
+    let known: std::collections::HashSet<_> = files.iter().map(|f| f.identity.as_str()).collect();
+    let has_stale = state.identities().any(|id| !known.contains(id.as_str()));
+    if total == 0 && !has_stale && !rebuild {
         return Ok(());
     }
 
@@ -43,6 +45,10 @@ pub fn ensure_index_fresh(index: &SessionIndex) -> Result<()> {
     );
 
     let mut writer = index.writer()?;
+    if rebuild {
+        index.clear(&mut writer)?;
+    }
+    prune_stale_sessions(index, &mut writer, &mut state, &files);
 
     // Progress callback prints to stderr
     let on_progress = Box::new(|p: IndexProgress| {
@@ -50,23 +56,29 @@ pub fn ensure_index_fresh(index: &SessionIndex) -> Result<()> {
         let _ = std::io::stderr().flush();
     });
 
-    index_files(
-        index,
-        &mut writer,
-        &mut state,
-        &files_to_index,
-        Some(on_progress),
-        None, // No reload callback for sync mode
-    )?;
+    if total > 0 {
+        index_files(
+            index,
+            &mut writer,
+            &mut state,
+            &files_to_index,
+            Some(on_progress),
+            None,
+        )?;
+    } else {
+        writer.commit()?;
+    }
 
     state.save(&state_path)?;
 
     // Clear progress line and print completion
-    eprintln!(
-        "\rIndexed {} session{}.    ",
-        total,
-        if total == 1 { "" } else { "s" }
-    );
+    if total > 0 {
+        eprintln!(
+            "\rIndexed {} session{}.    ",
+            total,
+            if total == 1 { "" } else { "s" }
+        );
+    }
 
     // Reload index to see new data
     index.reload()?;

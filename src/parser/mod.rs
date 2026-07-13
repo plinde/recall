@@ -10,7 +10,93 @@ pub use opencode::OpenCodeParser;
 
 use crate::session::{Message, Session};
 use anyhow::Result;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// A source-neutral reference to one indexable session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLocator {
+    /// Stable identity used by Tantivy and the index state.
+    pub identity: String,
+    /// Backing session file or database.
+    pub path: PathBuf,
+    /// Row ID for sessions stored inside a database.
+    pub database_session_id: Option<String>,
+    /// Per-session change fingerprint.
+    pub fingerprint: String,
+    /// Millisecond timestamp used to order indexing work.
+    pub sort_timestamp: i64,
+}
+
+impl SessionLocator {
+    fn file(path: PathBuf) -> Option<Self> {
+        let metadata = std::fs::metadata(&path).ok()?;
+        let modified = metadata.modified().ok()?;
+        let nanos = modified
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some(Self {
+            identity: path.to_string_lossy().into_owned(),
+            path,
+            database_session_id: None,
+            fingerprint: format!("{nanos}:{}", metadata.len()),
+            sort_timestamp: (nanos / 1_000_000) as i64,
+        })
+    }
+
+    pub fn from_session(session: &Session) -> Self {
+        if session.source == crate::session::SessionSource::OpenCode
+            && session.file_path.extension().is_some_and(|ext| ext == "db")
+        {
+            let id = session.id.clone();
+            Self {
+                identity: sqlite_identity(&session.file_path, &id),
+                path: session.file_path.clone(),
+                database_session_id: Some(id),
+                fingerprint: String::new(),
+                sort_timestamp: session.timestamp.timestamp_millis(),
+            }
+        } else {
+            Self::file(session.file_path.clone()).unwrap_or_else(|| Self {
+                identity: session.file_path.to_string_lossy().into_owned(),
+                path: session.file_path.clone(),
+                database_session_id: None,
+                fingerprint: String::new(),
+                sort_timestamp: session.timestamp.timestamp_millis(),
+            })
+        }
+    }
+
+    pub fn from_index_identity(identity: &str) -> Self {
+        if let Some(encoded) = identity.strip_prefix("opencode-sqlite:") {
+            if let Ok((path, id)) = serde_json::from_str::<(PathBuf, String)>(encoded) {
+                return Self {
+                    identity: identity.to_string(),
+                    path,
+                    database_session_id: Some(id),
+                    fingerprint: String::new(),
+                    sort_timestamp: 0,
+                };
+            }
+        }
+        let path = PathBuf::from(identity);
+        Self {
+            identity: identity.to_string(),
+            path,
+            database_session_id: None,
+            fingerprint: String::new(),
+            sort_timestamp: 0,
+        }
+    }
+}
+
+fn sqlite_identity(path: &Path, session_id: &str) -> String {
+    format!(
+        "opencode-sqlite:{}",
+        serde_json::to_string(&(path, session_id)).expect("paths and IDs serialize")
+    )
+}
 
 /// Join consecutive messages from the same role into single messages.
 /// Uses the latest timestamp when joining.
@@ -38,8 +124,8 @@ pub trait SessionParser {
     fn can_parse(path: &Path) -> bool;
 }
 
-/// Discover all session files from Claude Code, Codex CLI, and Factory
-pub fn discover_session_files() -> Vec<std::path::PathBuf> {
+/// Discover all sessions from supported sources.
+pub fn discover_sessions() -> Vec<SessionLocator> {
     let mut files = Vec::new();
 
     // Allow override for testing
@@ -64,7 +150,9 @@ pub fn discover_session_files() -> Vec<std::path::PathBuf> {
                                         continue;
                                     }
                                 }
-                                files.push(path);
+                                if let Some(locator) = SessionLocator::file(path) {
+                                    files.push(locator);
+                                }
                             }
                         }
                     }
@@ -81,7 +169,9 @@ pub fn discover_session_files() -> Vec<std::path::PathBuf> {
             {
                 let path = entry.path();
                 if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                    files.push(path.to_path_buf());
+                    if let Some(locator) = SessionLocator::file(path.to_path_buf()) {
+                        files.push(locator);
+                    }
                 }
             }
         }
@@ -95,32 +185,30 @@ pub fn discover_session_files() -> Vec<std::path::PathBuf> {
             {
                 let path = entry.path();
                 if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                    files.push(path.to_path_buf());
-                }
-            }
-        }
-
-        // OpenCode: ~/.local/share/opencode/storage/session/**/*.json
-        let opencode_dir = home.join(".local/share/opencode/storage/session");
-        if opencode_dir.exists() {
-            for entry in walkdir::WalkDir::new(&opencode_dir)
-                .into_iter()
-                .flatten()
-            {
-                let path = entry.path();
-                if path.extension().map(|e| e == "json").unwrap_or(false) {
-                    // Only include session files (ses_*.json)
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with("ses_") {
-                            files.push(path.to_path_buf());
-                        }
+                    if let Some(locator) = SessionLocator::file(path.to_path_buf()) {
+                        files.push(locator);
                     }
                 }
             }
         }
+
+        let opencode_root = if std::env::var_os("RECALL_HOME_OVERRIDE").is_some() {
+            home.join(".local/share/opencode")
+        } else {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .map(|p| p.join("opencode"))
+                .unwrap_or_else(|| home.join(".local/share/opencode"))
+        };
+        files.extend(OpenCodeParser::discover(&opencode_root));
     }
 
     files
+}
+
+/// Legacy path-only discovery API.
+pub fn discover_session_files() -> Vec<PathBuf> {
+    discover_sessions().into_iter().map(|locator| locator.path).collect()
 }
 
 /// Parse a session file, auto-detecting the format
@@ -135,6 +223,14 @@ pub fn parse_session_file(path: &Path) -> Result<Session> {
         OpenCodeParser::parse_file(path)
     } else {
         anyhow::bail!("Unknown session file format: {:?}", path)
+    }
+}
+
+pub fn parse_session(locator: &SessionLocator) -> Result<Session> {
+    if locator.database_session_id.is_some() {
+        OpenCodeParser::parse_locator(locator)
+    } else {
+        parse_session_file(&locator.path)
     }
 }
 
