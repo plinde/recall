@@ -55,8 +55,9 @@ pub fn run_search(
             .take(limit)
             .map(|r| {
                 // Load full session to get messages
-                let session = parser::parse_session_file(&r.session.file_path)
-                    .unwrap_or(r.session.clone());
+                let session =
+                    parser::parse_session(&parser::SessionLocator::from_session(&r.session))
+                        .unwrap_or(r.session.clone());
 
                 // Filter and score messages in one pass (avoids repeated to_lowercase in sort)
                 let mut scored_messages: Vec<(usize, usize, &Message)> = session
@@ -127,11 +128,11 @@ fn search_in_session(
     session_id: &str,
     context: usize,
 ) -> Result<()> {
-    let file_path = index
+    let locator = index
         .get_by_id(session_id)?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
-    let session = parser::parse_session_file(&file_path)?;
+    let session = parser::parse_session(&locator)?;
 
     let query_lower = query.to_lowercase();
     let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
@@ -260,12 +261,12 @@ pub fn run_read(session_id: &str) -> Result<()> {
     ensure_index_fresh(&index)?;
 
     // Find the session by ID
-    let file_path = index
+    let locator = index
         .get_by_id(session_id)?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
     // Parse full session
-    let session = parser::parse_session_file(&file_path)?;
+    let session = parser::parse_session(&locator)?;
     let output = session.to_read_output();
 
     println!("{}", serde_json::to_string_pretty(&output)?);

@@ -114,7 +114,7 @@ impl SessionIndex {
             let doc = doc!(
                 self.session_id => session.id.clone(),
                 self.source => session.source.as_str(),
-                self.file_path => session.file_path.to_string_lossy().to_string(),
+                self.file_path => crate::parser::SessionLocator::from_session(session).identity,
                 self.cwd => session.cwd.clone(),
                 self.git_branch => session.git_branch.clone().unwrap_or_default(),
                 self.timestamp => timestamp_secs,
@@ -127,13 +127,17 @@ impl SessionIndex {
         Ok(())
     }
 
-    /// Delete all documents for a session (by file path)
-    pub fn delete_session(&self, writer: &mut IndexWriter, file_path: &Path) {
-        let term = tantivy::Term::from_field_text(
-            self.file_path,
-            &file_path.to_string_lossy(),
-        );
+    /// Delete all documents for a session by stable locator identity.
+    pub fn delete_session(&self, writer: &mut IndexWriter, identity: &str) {
+        let term = tantivy::Term::from_field_text(self.file_path, identity);
         writer.delete_term(term);
+    }
+
+    pub fn clear(&self, writer: &mut IndexWriter) -> Result<()> {
+        writer
+            .delete_all_documents()
+            .map(|_| ())
+            .context("Failed to clear index")
     }
 
     /// Reload the reader to see recent changes
@@ -209,11 +213,11 @@ impl SessionIndex {
 
             let source = SessionSource::parse(source_str).unwrap_or(SessionSource::ClaudeCode);
 
-            let file_path = doc
+            let locator = doc
                 .get_first(self.file_path)
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .map(crate::parser::SessionLocator::from_index_identity)
+                .unwrap_or_else(|| crate::parser::SessionLocator::from_index_identity(""));
 
             let cwd = doc
                 .get_first(self.cwd)
@@ -254,7 +258,7 @@ impl SessionIndex {
                 session: Session {
                     id: session_id.clone(),
                     source,
-                    file_path: std::path::PathBuf::from(&file_path),
+                    file_path: locator.path,
                     cwd,
                     git_branch,
                     timestamp: chrono::DateTime::from_timestamp(timestamp_secs, 0)
@@ -346,11 +350,11 @@ impl SessionIndex {
 
             let source = SessionSource::parse(source_str).unwrap_or(SessionSource::ClaudeCode);
 
-            let file_path = doc
+            let locator = doc
                 .get_first(self.file_path)
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .map(crate::parser::SessionLocator::from_index_identity)
+                .unwrap_or_else(|| crate::parser::SessionLocator::from_index_identity(""));
 
             let cwd = doc
                 .get_first(self.cwd)
@@ -383,7 +387,7 @@ impl SessionIndex {
                 session: Session {
                     id: session_id.clone(),
                     source,
-                    file_path: std::path::PathBuf::from(&file_path),
+                    file_path: locator.path,
                     cwd,
                     git_branch,
                     timestamp: chrono::DateTime::from_timestamp(timestamp_secs, 0)
@@ -406,14 +410,14 @@ impl SessionIndex {
 
         // Sort by timestamp descending
         let mut results: Vec<_> = session_results.into_values().collect();
-        results.sort_by(|a, b| b.session.timestamp.cmp(&a.session.timestamp));
+        results.sort_by_key(|result| std::cmp::Reverse(result.session.timestamp));
         results.truncate(limit);
 
         Ok(results)
     }
 
-    /// Look up a session by ID and return its file path
-    pub fn get_by_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
+    /// Look up a session by ID and return its reload locator.
+    pub fn get_by_id(&self, session_id: &str) -> Result<Option<crate::parser::SessionLocator>> {
         let searcher = self.reader.searcher();
 
         let term = tantivy::Term::from_field_text(self.session_id, session_id);
@@ -424,15 +428,14 @@ impl SessionIndex {
         if let Some((_score, doc_addr)) = top_docs.first() {
             let doc: tantivy::TantivyDocument = searcher.doc(*doc_addr)?;
 
-            let file_path = doc
+            let locator = doc
                 .get_first(self.file_path)
                 .and_then(|v| v.as_str())
-                .map(PathBuf::from);
+                .map(crate::parser::SessionLocator::from_index_identity);
 
-            Ok(file_path)
+            Ok(locator)
         } else {
             Ok(None)
         }
     }
 }
-

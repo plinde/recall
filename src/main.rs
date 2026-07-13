@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
-use recall::{app::App, session, session::SessionSource, tui, ui};
+use recall::{app::App, session, session::SessionSource, tui, ui, InitialSearchScope};
 use std::time::Duration;
 
 mod cli;
@@ -16,6 +16,10 @@ struct Cli {
     /// Clear index and rebuild from scratch
     #[arg(long, global = true)]
     reindex: bool,
+
+    /// Start the interactive TUI searching all indexed conversations
+    #[arg(long = "global", visible_alias = "everywhere")]
+    global_search: bool,
 
     /// Initial search query (for interactive TUI mode)
     #[arg(trailing_var_arg = true)]
@@ -135,7 +139,7 @@ fn main() -> Result<()> {
         None => {
             // Interactive TUI mode
             let initial_query = cli.query.join(" ");
-            run_tui(initial_query)
+            run_tui(initial_query, initial_search_scope(cli.global_search)?)
         }
     }
 }
@@ -149,9 +153,38 @@ fn parse_source(source: &Option<String>) -> Result<Option<SessionSource>> {
     }
 }
 
-fn run_tui(initial_query: String) -> Result<()> {
+fn initial_search_scope(global_search: bool) -> Result<InitialSearchScope> {
+    let default_scope = match std::env::var("RECALL_DEFAULT_SCOPE") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("RECALL_DEFAULT_SCOPE must be valid Unicode")
+        }
+    };
+    resolve_initial_search_scope(global_search, default_scope.as_deref())
+}
+
+fn resolve_initial_search_scope(
+    global_search: bool,
+    default_scope: Option<&str>,
+) -> Result<InitialSearchScope> {
+    if global_search {
+        return Ok(InitialSearchScope::Everything);
+    }
+
+    match default_scope {
+        Some("everything") => Ok(InitialSearchScope::Everything),
+        Some("folder") => Ok(InitialSearchScope::Folder),
+        None => Ok(InitialSearchScope::Everything),
+        Some(value) => anyhow::bail!(
+            "Invalid RECALL_DEFAULT_SCOPE value '{value}'. Valid values: everything, folder"
+        ),
+    }
+}
+
+fn run_tui(initial_query: String, initial_scope: InitialSearchScope) -> Result<()> {
     // Initialize app (starts background indexing automatically)
-    let mut app = App::new(initial_query)?;
+    let mut app = App::new_with_scope(initial_query, initial_scope)?;
 
     // Initialize terminal
     let mut terminal = tui::init()?;
@@ -223,6 +256,9 @@ fn run(terminal: &mut tui::Tui, app: &mut App) -> Result<()> {
                     KeyCode::Backspace => app.on_backspace(),
                     KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.toggle_focused_expansion();
+                    }
+                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.toggle_scope();
                     }
                     KeyCode::Char('/') => app.toggle_scope(),
                     KeyCode::Char(c) => app.on_char(c),
@@ -321,5 +357,41 @@ fn clear_index_cache() {
 
     if cache_dir.exists() {
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_global_scope_flags() {
+        assert!(Cli::try_parse_from(["recall", "--global"])
+            .unwrap()
+            .global_search);
+        assert!(Cli::try_parse_from(["recall", "--everywhere"])
+            .unwrap()
+            .global_search);
+    }
+
+    #[test]
+    fn resolves_default_scope_and_flag_precedence() {
+        assert_eq!(
+            resolve_initial_search_scope(false, None).unwrap(),
+            InitialSearchScope::Everything
+        );
+        assert_eq!(
+            resolve_initial_search_scope(false, Some("everything")).unwrap(),
+            InitialSearchScope::Everything
+        );
+        assert_eq!(
+            resolve_initial_search_scope(false, Some("folder")).unwrap(),
+            InitialSearchScope::Folder
+        );
+        assert_eq!(
+            resolve_initial_search_scope(true, Some("folder")).unwrap(),
+            InitialSearchScope::Everything
+        );
+        assert!(resolve_initial_search_scope(false, Some("global")).is_err());
     }
 }
